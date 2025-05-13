@@ -121,15 +121,15 @@ class ParameterOptimizer(QObject):
             if region_rect:
                 self.motion_regions[filename] = region_rect
     
-    def abort_optimization(self):
+    def abort_processing(self):
         """Request abort of current optimization."""
         self.abort_flag = True
-    
+
     def run_optimization(self):
         """Execute Bayesian optimization for flow parameters."""
         if self.abort_flag:
             return
-        
+
         # Define search space
         optimization_space = [
             Real(0.5, 2.5, name='gamma'),
@@ -145,33 +145,33 @@ class ParameterOptimizer(QObject):
             Real(10.0, 150.0, name='bilateral_sigma_space'),
             Real(1e-6, 1e-2, name='det_threshold')
         ]
-        
+
         # Cache for parameter evaluations
         evaluation_cache = {}
         best_score = float('-inf')
         best_parameters = None
-        
+
         self.progress.emit(0, "Starting parameter optimization...")
-        
+
         def evaluate_parameters(params):
             """Evaluate a parameter set for optical flow quality."""
             if self.abort_flag:
                 return float('-inf')
-            
+
             # Unpack parameters
             gamma, gaussian_sigma, window_size, motion_threshold, vector_scale, gradient_scale, \
             pyramid_levels, temporal_kernel_size, bilateral_d, bilateral_sigma_color, \
             bilateral_sigma_space, det_threshold = params
-            
+
             # Create cache key
             cache_key = (f"{gamma:.3f}_{gaussian_sigma:.3f}_{window_size}_{motion_threshold:.3f}_"
                         f"{vector_scale:.3f}_{gradient_scale:.6f}_{pyramid_levels}_{temporal_kernel_size}_"
                         f"{bilateral_d}_{bilateral_sigma_color:.1f}_{bilateral_sigma_space:.1f}_{det_threshold:.6f}")
-            
+
             # Check cache
             if cache_key in evaluation_cache:
                 return evaluation_cache[cache_key]
-            
+
             # Create configuration object
             config = FlowConfiguration()
             config.gamma = gamma
@@ -190,32 +190,32 @@ class ParameterOptimizer(QObject):
             config.bilateral_sigma_color = bilateral_sigma_color
             config.bilateral_sigma_space = bilateral_sigma_space
             config.det_threshold = det_threshold
-            
+
             # Evaluate on all test images
             scores = []
             total_images = len(self.test_images)
-            
+
             for i, (filename, img) in enumerate(self.test_images):
                 if self.abort_flag:
                     return float('-inf')
-                
+
                 # Get motion region for this pair
                 region_rect = self.motion_regions.get(filename)
                 if not region_rect:
                     continue
-                
+
                 # Preprocess images
                 preprocessed_base = preprocess_image(self.base_image.copy(), config)
                 preprocessed_img = preprocess_image(img.copy(), config)
-                
+
                 # Determine algorithm based on filename
                 use_hierarchical = 'R5' in filename or 'R10' in filename or 'R20' in filename or 'R40' in filename
-                
+
                 # Compute optical flow
                 try:
                     if use_hierarchical:
                         U, V = hierarchical_lucas_kanade_flow(
-                            preprocessed_base, 
+                            preprocessed_base,
                             preprocessed_img,
                             config.pyramid_levels,
                             int(config.window_size),
@@ -226,40 +226,40 @@ class ParameterOptimizer(QObject):
                         )
                     else:
                         U, V = basic_lucas_kanade_flow(
-                            preprocessed_base, 
-                            preprocessed_img, 
-                            config.window_size, 
-                            config.kernel_type, 
+                            preprocessed_base,
+                            preprocessed_img,
+                            config.window_size,
+                            config.kernel_type,
                             config.gaussian_sigma
                         )
                 except Exception as e:
                     print(f"Error computing flow: {str(e)}")
                     return float('-inf')
-                
+
                 # Calculate quality score
                 score = compute_flow_quality_score(U, V, region_rect)
                 scores.append(score)
-                
+
                 # Update progress
                 self.progress.emit(
                     int(i/total_images * 100),
                     f"Evaluating parameters {i+1}/{total_images}"
                 )
-            
+
             # Calculate average score
             avg_score = np.mean(scores) if scores else 0
-            
+
             # Cache result
             evaluation_cache[cache_key] = avg_score
-            
+
             # Track best parameters
             nonlocal best_score, best_parameters
             if avg_score > best_score:
                 best_score = avg_score
                 best_parameters = params
-            
+
             return avg_score
-        
+
         # Run Bayesian optimization
         try:
             result = gp_minimize(
@@ -274,19 +274,19 @@ class ParameterOptimizer(QObject):
             print(f"Optimization error: {str(e)}")
             self.progress.emit(100, f"Optimization error: {str(e)}")
             return
-        
+
         if self.abort_flag:
             return
-        
+
         # Create optimized configuration
         optimized_config = self.create_optimized_config(result.x)
-        
+
         # Emit optimized parameters
         self.optimized_params.emit(optimized_config)
-        
+
         # Process images with optimized parameters
         self.process_with_optimized_params(optimized_config)
-    
+
     def create_optimized_config(self, optimization_result: list) -> FlowConfiguration:
         """Create configuration object from optimization results."""
         config = FlowConfiguration()
@@ -304,34 +304,34 @@ class ParameterOptimizer(QObject):
         config.det_threshold = optimization_result[11]
         config.use_bilateral = True
         config.kernel_type = 'gaussian'
-        
+
         return config
-    
+
     def process_with_optimized_params(self, config: FlowConfiguration):
         """Process all images with optimized parameters."""
         if self.abort_flag:
             return
-            
+
         results = []
         total = len(self.test_images)
-        
+
         self.progress.emit(0, "Applying optimized parameters...")
-        
+
         for i, (filename, img) in enumerate(self.test_images):
             if self.abort_flag:
                 return
-                
+
             # Preprocess images
             preprocessed_base = preprocess_image(self.base_image, config)
             preprocessed_img = preprocess_image(img, config)
-            
+
             # Determine algorithm
             use_hierarchical = 'R5' in filename or 'R10' in filename or 'R20' in filename or 'R40' in filename
-            
+
             # Compute optical flow
             if use_hierarchical:
                 U, V = hierarchical_lucas_kanade_flow(
-                    preprocessed_base, 
+                    preprocessed_base,
                     preprocessed_img,
                     config.pyramid_levels,
                     int(config.window_size),
@@ -342,21 +342,21 @@ class ParameterOptimizer(QObject):
                 )
             else:
                 U, V = basic_lucas_kanade_flow(
-                    preprocessed_base, 
-                    preprocessed_img, 
-                    int(config.window_size), 
-                    config.kernel_type, 
+                    preprocessed_base,
+                    preprocessed_img,
+                    int(config.window_size),
+                    config.kernel_type,
                     config.gaussian_sigma
                 )
-            
+
             # Compute difference image
             diff = compute_image_difference(preprocessed_base, preprocessed_img)
-            
+
             # Get motion region for visualization
             region_rect = self.motion_regions.get(filename)
-            
+
             results.append((filename, img, preprocessed_img, diff, U, V, region_rect))
-            
+
             self.progress.emit(int((i + 1) * 100 / total), f"Processing image {i+1}/{total}")
-            
+
         self.finished.emit(results)

@@ -1,6 +1,3 @@
-"""
-Main window implementation for the OpticalFlow visualization system.
-"""
 import os
 import sys
 import numpy as np
@@ -44,6 +41,81 @@ class RowSelectionManager:
         """Select a row and return its configuration."""
         self.selected_row = row_index
         return self.get_row_config(row_index)
+
+
+class AllRowsProcessingWorker(QThread):
+    """Worker for processing all images with updated parameters."""
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(list)
+    
+    def __init__(self, base_image: np.ndarray, test_images: list, 
+                 config: FlowConfiguration, motion_regions: dict):
+        super().__init__()
+        self.base_image = base_image
+        self.test_images = test_images
+        self.config = config
+        self.abort_flag = False
+        self.motion_regions = motion_regions
+    
+    def abort_processing(self):
+        """Request processing abort."""
+        self.abort_flag = True
+    
+    def run(self):
+        """Process all images with current configuration."""
+        if self.abort_flag:
+            return
+        
+        results = []
+        total = len(self.test_images)
+        
+        for i, (filename, img) in enumerate(self.test_images):
+            if self.abort_flag:
+                return
+            
+            self.progress.emit(int(i/total * 100), f"Processing {filename}...")
+            
+            # Preprocess images
+            preprocessed_base = preprocess_image(self.base_image, self.config)
+            preprocessed_img = preprocess_image(img, self.config)
+            
+            # Determine algorithm
+            use_hierarchical = 'R5' in filename or 'R10' in filename or 'R20' in filename or 'R40' in filename
+            
+            # Compute optical flow
+            if use_hierarchical:
+                U, V = hierarchical_lucas_kanade_flow(
+                    preprocessed_base, 
+                    preprocessed_img,
+                    self.config.pyramid_levels,
+                    int(self.config.window_size),
+                    self.config.kernel_type,
+                    self.config.gaussian_sigma,
+                    self.config.interpolation_method,
+                    self.config.border_mode
+                )
+            else:
+                U, V = basic_lucas_kanade_flow(
+                    preprocessed_base, 
+                    preprocessed_img, 
+                    int(self.config.window_size), 
+                    self.config.kernel_type, 
+                    self.config.gaussian_sigma
+                )
+            
+            # Compute difference
+            diff = compute_image_difference(preprocessed_base, preprocessed_img)
+            region_rect = self.motion_regions.get(filename)
+            
+            # Calculate quality score
+            score = compute_flow_quality_score(U, V, region_rect)
+            
+            result = (filename, img, preprocessed_img, diff, U, V, region_rect)
+            results.append(result)
+            
+            self.progress.emit(int((i + 1)/total * 100), f"Completed {filename} (quality: {score:.4f})")
+        
+        self.finished.emit(results)
 
 
 class SingleRowProcessingWorker(QThread):
@@ -179,7 +251,7 @@ class FlowVisualizationWindow(QMainWindow):
         
         # Parameter control panel
         self.control_panel = ParameterControlPanel()
-        self.control_panel.parametersChanged.connect(self.update_flow_processing)
+        self.control_panel.parametersChanged.connect(self.on_parameters_changed)
         
         # Add widgets to splitter
         self.splitter.addWidget(self.scroll_area)
@@ -215,7 +287,8 @@ class FlowVisualizationWindow(QMainWindow):
     def cleanup_workers(self):
         """Clean up any running worker threads."""
         if self.current_worker:
-            self.current_worker.abort_processing()
+            if hasattr(self.current_worker, 'abort_processing'):
+                self.current_worker.abort_processing()
         if self.worker_thread and self.worker_thread.isRunning():
             self.worker_thread.quit()
             self.worker_thread.wait(1000)
@@ -285,46 +358,49 @@ class FlowVisualizationWindow(QMainWindow):
         
         return config_copy
     
-    def update_flow_processing(self, config: FlowConfiguration):
-        """Process selected image with new parameters."""
-        if self.row_manager.selected_row >= 0:
-            # Store configuration for current row
-            config_copy = self.copy_configuration(config)
-            self.row_manager.store_row_config(self.row_manager.selected_row, config_copy)
+    def on_parameters_changed(self, config: FlowConfiguration, is_update_button: bool):
+        """Handle parameter changes from control panel."""
+        if not is_update_button:
+            # Just a parameter change, not from update button
+            return
             
-            # Process only selected row
-            if 0 <= self.row_manager.selected_row < len(self.test_images):
-                filename, img = self.test_images[self.row_manager.selected_row]
-                
-                self.progress_bar.show()
-                self.progress_bar.setValue(0)
-                
-                # Create worker for single row
-                self.worker_thread = QThread()
-                self.current_worker = SingleRowProcessingWorker(
-                    self.base_image, 
-                    filename, 
-                    img, 
-                    config_copy,
-                    motion_regions=self.motion_regions,
-                    row_index=self.row_manager.selected_row
-                )
-                self.current_worker.moveToThread(self.worker_thread)
-                
-                self.worker_thread.started.connect(self.current_worker.run)
-                self.current_worker.progress.connect(self.update_progress)
-                self.current_worker.finished.connect(self.on_single_row_processed)
-                
-                self.worker_thread.start()
-    
-    def on_single_row_processed(self, row_index: int, result: tuple):
-        """Handle completion of single row processing."""
-        if 0 <= row_index < len(self.current_results):
-            self.current_results[row_index] = result
+        # Reprocess all images with new parameters
+        self.cleanup_workers()
+        self.progress_bar.show()
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Reprocessing all images...")
         
+        # Create deep copy of configuration for worker thread
+        config_copy = self.copy_configuration(config)
+        
+        # Create worker for all rows
+        self.worker_thread = QThread()
+        self.current_worker = AllRowsProcessingWorker(
+            self.base_image, 
+            self.test_images, 
+            config_copy,
+            self.motion_regions
+        )
+        self.current_worker.moveToThread(self.worker_thread)
+        
+        self.worker_thread.started.connect(self.current_worker.run)
+        self.current_worker.progress.connect(self.update_progress)
+        self.current_worker.finished.connect(self.on_all_rows_processed)
+        
+        self.worker_thread.start()
+    
+    def on_all_rows_processed(self, results: list):
+        """Handle completion of all rows processing."""
+        self.current_results = results
         self.update_visualization_display()
-        self.control_panel.update_vector_displays([result])
+        self.control_panel.update_vector_displays(results)
         self.progress_bar.hide()
+        self.progress_label.setText(f"Processed {len(results)} images successfully.")
+        
+        # Store configuration for current displayed rows
+        config_copy = self.copy_configuration(self.control_panel.flow_config)
+        for i in range(len(results)):
+            self.row_manager.store_row_config(i, config_copy)
     
     def update_visualization_display(self):
         """Update the main visualization grid."""
@@ -427,11 +503,6 @@ class FlowVisualizationWindow(QMainWindow):
                 self.grid_layout.addWidget(img_cell, row, 0)
                 self.grid_layout.addWidget(diff_cell, row, 1)
                 self.grid_layout.addWidget(flow_cell, row, 2)
-            
-            # Store configuration for unselected rows
-            if row not in self.row_manager.row_configurations:
-                config_copy = self.copy_configuration(self.control_panel.flow_config)
-                self.row_manager.store_row_config(row, config_copy)
     
     def on_row_selection_changed(self, row_index: int):
         """Handle row selection change."""
